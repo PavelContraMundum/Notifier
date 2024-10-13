@@ -3,6 +3,8 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as Path;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:intl/intl.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest_all.dart' as tz;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -332,6 +334,7 @@ final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
 Future<void> initNotifications() async {
+  tz.initializeTimeZones();
   const AndroidInitializationSettings initializationSettingsAndroid =
       AndroidInitializationSettings('@mipmap/ic_launcher');
   const DarwinInitializationSettings initializationSettingsIOS =
@@ -359,11 +362,16 @@ Future<void> scheduleNotification(Task task) async {
     iOS: iOSPlatformChannelSpecifics,
   );
 
-  await flutterLocalNotificationsPlugin.schedule(
+  await flutterLocalNotificationsPlugin.zonedSchedule(
     task.id ?? 0,
     task.title,
     task.description,
-    task.dateTime,
+    // task.dateTime,
+    tz.TZDateTime.from(task.dateTime, tz.local),
     platformChannelSpecifics,
+    androidAllowWhileIdle: true,
+    uiLocalNotificationDateInterpretation:
+        UILocalNotificationDateInterpretation.absoluteTime,
+    matchDateTimeComponents: DateTimeComponents.time,
   );
 }
