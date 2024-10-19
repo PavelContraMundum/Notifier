@@ -122,6 +122,15 @@ class DatabaseHelper {
   }
 }
 
+Future<void> cancelNotification(int id) async {
+  await flutterLocalNotificationsPlugin.cancel(id);
+}
+
+// Přidejte tuto funkci pro zrušení všech notifikací
+Future<void> cancelAllNotifications() async {
+  await flutterLocalNotificationsPlugin.cancelAll();
+}
+
 class TaskListScreen extends StatefulWidget {
   const TaskListScreen({Key? key}) : super(key: key);
 
@@ -145,19 +154,110 @@ class TaskListScreenState extends State<TaskListScreen> {
     });
   }
 
+  Future<void> _deleteTask(Task task) async {
+    // Smažeme úkol z databáze
+    await DatabaseHelper.instance.deleteTask(task.id!);
+    // Zrušíme příslušnou notifikaci
+    await cancelNotification(task.id!);
+    // Znovu načteme seznam úkolů
+    await _loadTasks();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Moje úkoly')),
+      appBar: AppBar(
+        title: const Text('Moje úkoly'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.notifications_off),
+            onPressed: () async {
+              // Přidáme dialogové okno pro potvrzení
+              final bool? result = await showDialog<bool>(
+                context: context,
+                builder: (BuildContext context) {
+                  return AlertDialog(
+                    title: const Text('Zrušit všechna upozornění'),
+                    content: const Text(
+                        'Opravdu chcete zrušit všechna naplánovaná upozornění?'),
+                    actions: <Widget>[
+                      TextButton(
+                        child: const Text('Ne'),
+                        onPressed: () => Navigator.of(context).pop(false),
+                      ),
+                      TextButton(
+                        child: const Text('Ano'),
+                        onPressed: () => Navigator.of(context).pop(true),
+                      ),
+                    ],
+                  );
+                },
+              );
+
+              if (result == true) {
+                await cancelAllNotifications();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Všechna upozornění byla zrušena'),
+                  ),
+                );
+              }
+            },
+          ),
+        ],
+      ),
       body: ListView.builder(
         itemCount: tasks.length,
         itemBuilder: (context, index) {
-          return ListTile(
-            title: Text(tasks[index].title),
-            subtitle: Text(tasks[index].description),
-            trailing: Text(
-                DateFormat('dd.MM.yyyy HH:mm').format(tasks[index].dateTime)),
-            onTap: () => _editTask(tasks[index]),
+          return Dismissible(
+            // Přidáme možnost swipe-to-delete
+            key: Key(tasks[index].id.toString()),
+            direction: DismissDirection.endToStart,
+            background: Container(
+              color: Colors.red,
+              alignment: Alignment.centerRight,
+              padding: const EdgeInsets.symmetric(horizontal: 20.0),
+              child: const Icon(
+                Icons.delete,
+                color: Colors.white,
+              ),
+            ),
+            confirmDismiss: (direction) async {
+              return await showDialog(
+                context: context,
+                builder: (BuildContext context) {
+                  return AlertDialog(
+                    title: const Text('Potvrdit smazání'),
+                    content: const Text('Opravdu chcete smazat tento úkol?'),
+                    actions: <Widget>[
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(false),
+                        child: const Text('Ne'),
+                      ),
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(true),
+                        child: const Text('Ano'),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+            onDismissed: (direction) {
+              _deleteTask(tasks[index]);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Úkol byl smazán'),
+                ),
+              );
+            },
+            child: ListTile(
+              title: Text(tasks[index].title),
+              subtitle: Text(tasks[index].description),
+              trailing: Text(
+                  DateFormat('dd.MM.yyyy HH:mm').format(tasks[index].dateTime)),
+              onTap: () => _editTask(tasks[index]),
+            ),
           );
         },
       ),
