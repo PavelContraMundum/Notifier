@@ -8,6 +8,7 @@ import 'package:timezone/data/latest_all.dart' as tz;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  tz.initializeTimeZones();
   await initNotifications();
   runApp(const MyApp());
 }
@@ -18,6 +19,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      debugShowCheckedModeBanner: false,
       title: 'Připomínky úkolů',
       theme: ThemeData(primarySwatch: Colors.blue),
       home: const TaskListScreen(),
@@ -31,6 +33,7 @@ class Task {
   final String description;
   final DateTime dateTime;
   final String frequency;
+  final int? periodicity;
 
   const Task({
     this.id,
@@ -38,6 +41,7 @@ class Task {
     required this.description,
     required this.dateTime,
     required this.frequency,
+    this.periodicity,
   });
 
   Map<String, dynamic> toMap() {
@@ -47,6 +51,7 @@ class Task {
       'description': description,
       'dateTime': dateTime.toIso8601String(),
       'frequency': frequency,
+      'periodicity': periodicity,
     };
   }
 
@@ -57,6 +62,7 @@ class Task {
       description: map['description'],
       dateTime: DateTime.parse(map['dateTime']),
       frequency: map['frequency'],
+      periodicity: map['periodicity'],
     );
   }
 }
@@ -86,7 +92,8 @@ class DatabaseHelper {
         title TEXT,
         description TEXT,
         dateTime TEXT,
-        frequency TEXT
+        frequency TEXT,
+        periodicity INTEGER
       )
     ''');
   }
@@ -119,6 +126,11 @@ class DatabaseHelper {
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  Future<int> deleteAllTasks() async {
+    final db = await database;
+    return await db.delete('tasks');
   }
 }
 
@@ -163,6 +175,34 @@ class TaskListScreenState extends State<TaskListScreen> {
     await _loadTasks();
   }
 
+  Future<void> _deleteAllTasks() async {
+    try {
+      // Zrušíme všechny notifikace
+      await cancelAllNotifications();
+      // Smažeme všechny úkoly z databáze
+      await DatabaseHelper.instance.deleteAllTasks();
+      // Aktualizujeme UI
+      await _loadTasks();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Všechny úkoly a upozornění byly smazány'),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Došlo k chybě při mazání úkolů'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -195,12 +235,7 @@ class TaskListScreenState extends State<TaskListScreen> {
               );
 
               if (result == true) {
-                await cancelAllNotifications();
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Všechna upozornění byla zrušena'),
-                  ),
-                );
+                await _deleteAllTasks();
               }
             },
           ),
@@ -306,9 +341,11 @@ class TaskEditScreenState extends State<TaskEditScreen> {
   final _formKey = GlobalKey<FormState>();
   late TextEditingController _titleController;
   late TextEditingController _descriptionController;
+  late TextEditingController _periodicityController;
   late DateTime _selectedDate;
   late TimeOfDay _selectedTime;
   String _frequency = 'once';
+  bool _showPeriodicityField = false;
 
   @override
   void initState() {
@@ -316,10 +353,13 @@ class TaskEditScreenState extends State<TaskEditScreen> {
     _titleController = TextEditingController(text: widget.task?.title ?? '');
     _descriptionController =
         TextEditingController(text: widget.task?.description ?? '');
+    _periodicityController = TextEditingController(
+        text: (widget.task?.periodicity ?? 14).toString());
     _selectedDate = widget.task?.dateTime ?? DateTime.now();
     _selectedTime =
         TimeOfDay.fromDateTime(widget.task?.dateTime ?? DateTime.now());
     _frequency = widget.task?.frequency ?? 'once';
+    _showPeriodicityField = _frequency == 'custom';
   }
 
   @override
@@ -360,19 +400,43 @@ class TaskEditScreenState extends State<TaskEditScreen> {
             ),
             DropdownButtonFormField<String>(
               value: _frequency,
-              items: ['once', 'daily', 'weekly', 'monthly']
-                  .map((label) => DropdownMenuItem(
-                        value: label,
-                        child: Text(label),
-                      ))
-                  .toList(),
+              items: [
+                DropdownMenuItem(value: 'once', child: Text('Jednou')),
+                DropdownMenuItem(value: 'daily', child: Text('Denně')),
+                DropdownMenuItem(value: 'weekly', child: Text('Týdně')),
+                DropdownMenuItem(value: 'monthly', child: Text('Měsíčně')),
+                DropdownMenuItem(
+                    value: 'custom', child: Text('Vlastní perioda')),
+              ],
               onChanged: (value) {
                 setState(() {
                   _frequency = value!;
+                  _showPeriodicityField = value == 'custom';
                 });
               },
               decoration: const InputDecoration(labelText: 'Frekvence'),
             ),
+            if (_showPeriodicityField)
+              TextFormField(
+                controller: _periodicityController,
+                decoration: const InputDecoration(
+                  labelText: 'Počet dní mezi opakováním',
+                  hintText: 'Např. 14 pro dvoutýdenní opakování',
+                ),
+                keyboardType: TextInputType.number,
+                validator: (value) {
+                  if (_showPeriodicityField) {
+                    if (value == null || value.isEmpty) {
+                      return 'Zadejte počet dní';
+                    }
+                    final number = int.tryParse(value);
+                    if (number == null || number < 1) {
+                      return 'Zadejte platné číslo větší než 0';
+                    }
+                  }
+                  return null;
+                },
+              ),
             ElevatedButton(
               child: const Text('Uložit'),
               onPressed: _saveTask,
@@ -424,6 +488,9 @@ class TaskEditScreenState extends State<TaskEditScreen> {
         description: _descriptionController.text,
         dateTime: dateTime,
         frequency: _frequency,
+        periodicity: _showPeriodicityField
+            ? int.tryParse(_periodicityController.text)
+            : null,
       );
       Navigator.pop(context, task);
     }
@@ -446,23 +513,142 @@ Future<void> initNotifications() async {
   await flutterLocalNotificationsPlugin.initialize(initializationSettings);
 }
 
-Future<void> scheduleNotification(Task task) async {
-  const AndroidNotificationDetails androidPlatformChannelSpecifics =
-      AndroidNotificationDetails(
-    'your channel id',
-    'your channel name',
-    channelDescription: 'your channel description',
-    importance: Importance.max,
-    priority: Priority.high,
-  );
-  const DarwinNotificationDetails iOSPlatformChannelSpecifics =
-      DarwinNotificationDetails();
-  const NotificationDetails platformChannelSpecifics = NotificationDetails(
-    android: androidPlatformChannelSpecifics,
-    iOS: iOSPlatformChannelSpecifics,
+tz.TZDateTime _nextInstanceOfTime(tz.TZDateTime scheduledDate) {
+  final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
+  tz.TZDateTime scheduledTime = tz.TZDateTime(
+    tz.local,
+    now.year,
+    now.month,
+    now.day,
+    scheduledDate.hour,
+    scheduledDate.minute,
   );
 
-  await flutterLocalNotificationsPlugin.zonedSchedule(
+  if (scheduledTime.isBefore(now)) {
+    scheduledTime = scheduledTime.add(const Duration(days: 1));
+  }
+  return scheduledTime;
+}
+
+tz.TZDateTime _nextInstanceOfWeekday(tz.TZDateTime scheduledDate) {
+  tz.TZDateTime scheduledTime = _nextInstanceOfTime(scheduledDate);
+  while (scheduledTime.weekday != scheduledDate.weekday) {
+    scheduledTime = scheduledTime.add(const Duration(days: 1));
+  }
+  return scheduledTime;
+}
+
+tz.TZDateTime _nextInstanceOfMonthDay(tz.TZDateTime scheduledDate) {
+  tz.TZDateTime scheduledTime = _nextInstanceOfTime(scheduledDate);
+  while (scheduledTime.day != scheduledDate.day) {
+    scheduledTime = scheduledTime.add(const Duration(days: 1));
+  }
+  return scheduledTime;
+}
+
+Future<void> scheduleNotification(Task task) async {
+  const NotificationDetails platformChannelSpecifics = NotificationDetails(
+    android: AndroidNotificationDetails(
+      'your channel id',
+      'your channel name',
+      channelDescription: 'your channel description',
+      importance: Importance.max,
+      priority: Priority.high,
+    ),
+    iOS: DarwinNotificationDetails(),
+  );
+
+  final tz.TZDateTime scheduledDate =
+      tz.TZDateTime.from(task.dateTime, tz.local);
+
+  DateTimeComponents? matchDateTimeComponents;
+  tz.TZDateTime nextValidDate = scheduledDate;
+
+  switch (task.frequency) {
+    case 'custom':
+      // Pro vlastní periodicitu použijeme specifickou logiku
+      nextValidDate = _nextInstanceOfCustomPeriod(
+        scheduledDate,
+        task.periodicity ?? 14, // defaultně 14 dní, pokud není specifikováno
+      );
+      matchDateTimeComponents =
+          null; // Pro vlastní periodicitu nepoužíváme matchDateTimeComponents
+      break;
+    case 'daily':
+      matchDateTimeComponents = DateTimeComponents.time;
+      nextValidDate = _nextInstanceOfTime(scheduledDate);
+      break;
+    case 'weekly':
+      matchDateTimeComponents = DateTimeComponents.dayOfWeekAndTime;
+      nextValidDate = _nextInstanceOfWeekday(scheduledDate);
+      break;
+    case 'monthly':
+      matchDateTimeComponents = DateTimeComponents.dayOfMonthAndTime;
+      nextValidDate = _nextInstanceOfMonthDay(scheduledDate);
+      break;
+    case 'once':
+    default:
+      matchDateTimeComponents = null;
+  }
+
+  // Pro vlastní periodicitu musíme vytvořit sérii notifikací
+  if (task.frequency == 'custom') {
+    // Vytvoříme několik následujících notifikací
+    for (int i = 0; i < 10; i++) {
+      // Vytvoříme 10 následujících notifikací
+      final tz.TZDateTime notificationDate =
+          nextValidDate.add(Duration(days: i * (task.periodicity ?? 14)));
+
+      // Kontrola, že datum není v minulosti
+      if (notificationDate.isAfter(tz.TZDateTime.now(tz.local))) {
+        await flutterLocalNotificationsPlugin.zonedSchedule(
+          (task.id ?? 0) + (i * 1000), // Unikátní ID pro každou notifikaci
+          task.title,
+          task.description,
+          notificationDate,
+          platformChannelSpecifics,
+          androidAllowWhileIdle: true,
+          uiLocalNotificationDateInterpretation:
+              UILocalNotificationDateInterpretation.absoluteTime,
+        );
+      }
+    }
+  } else {
+    // Standardní notifikace pro ostatní frekvence
+    await flutterLocalNotificationsPlugin.zonedSchedule(
+      task.id ?? 0,
+      task.title,
+      task.description,
+      nextValidDate,
+      platformChannelSpecifics,
+      androidAllowWhileIdle: true,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: matchDateTimeComponents,
+    );
+  }
+}
+
+// Přidáme novou pomocnou funkci pro výpočet vlastní periodicity
+tz.TZDateTime _nextInstanceOfCustomPeriod(
+    tz.TZDateTime scheduledDate, int days) {
+  final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
+  tz.TZDateTime scheduledTime = tz.TZDateTime(
+    tz.local,
+    now.year,
+    now.month,
+    now.day,
+    scheduledDate.hour,
+    scheduledDate.minute,
+  );
+
+  while (scheduledTime.isBefore(now)) {
+    scheduledTime = scheduledTime.add(Duration(days: days));
+  }
+
+  return scheduledTime;
+
+  /* await flutterLocalNotificationsPlugin.zonedSchedule(
     task.id ?? 0,
     task.title,
     task.description,
@@ -473,5 +659,5 @@ Future<void> scheduleNotification(Task task) async {
     uiLocalNotificationDateInterpretation:
         UILocalNotificationDateInterpretation.absoluteTime,
     matchDateTimeComponents: DateTimeComponents.time,
-  );
+  ); */
 }
