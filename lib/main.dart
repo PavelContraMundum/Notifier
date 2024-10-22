@@ -1,3 +1,6 @@
+import 'dart:io';
+//import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as Path;
@@ -5,9 +8,116 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:intl/intl.dart';
 import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest_all.dart' as tz;
+import 'package:workmanager/workmanager.dart';
+
+// Top-level callback funkce pro Workmanager
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((taskName, inputData) async {
+    switch (taskName) {
+      case 'checkScheduledTasks':
+        await initNotifications(); // Inicializace notifikací
+        final db = await DatabaseHelper.instance.database;
+        final tasks = await DatabaseHelper.instance.getTasks();
+        final now = DateTime.now();
+        
+        for (var task in tasks) {
+          if (shouldShowNotification(task, now)) {
+            await flutterLocalNotificationsPlugin.show(
+              task.id ?? 0,
+              task.title,
+              task.description,
+              const NotificationDetails(
+                android: AndroidNotificationDetails(
+                  'task_notifications',
+                  'Task Notifications',
+                  channelDescription: 'Notifications for scheduled tasks',
+                  importance: Importance.max,
+                  priority: Priority.high,
+                ),
+              ),
+            );
+            
+            // Aktualizace času příští notifikace pro opakující se úkoly
+            if (task.frequency != 'once') {
+              final nextDateTime = calculateNextNotificationTime(task);
+              await db.update(
+                'tasks',
+                {'dateTime': nextDateTime.toIso8601String()},
+                where: 'id = ?',
+                whereArgs: [task.id],
+              );
+            }
+          }
+        }
+        break;
+    }
+    return true;
+  });
+}
+
+
+bool shouldShowNotification(Task task, DateTime now) {
+  final scheduledTime = task.dateTime;
+  final difference = now.difference(scheduledTime);
+  
+  // Kontrola zda je čas notifikace v rozmezí posledních 5 minut
+  if (difference.inMinutes.abs() <= 5) {
+    return true;
+  }
+  
+  return false;
+}
+
+DateTime calculateNextNotificationTime(Task task) {
+  final now = DateTime.now();
+  DateTime nextTime = task.dateTime;
+  
+  switch (task.frequency) {
+    case 'daily':
+      nextTime = nextTime.add(const Duration(days: 1));
+      break;
+    case 'weekly':
+      nextTime = nextTime.add(const Duration(days: 7));
+      break;
+    case 'monthly':
+      nextTime = DateTime(
+        nextTime.year,
+        nextTime.month + 1,
+        nextTime.day,
+        nextTime.hour,
+        nextTime.minute,
+      );
+      break;
+    case 'custom':
+      nextTime = nextTime.add(Duration(days: task.periodicity ?? 14));
+      break;
+  }
+  
+  // Ujistěte se, že příští čas je v budoucnosti
+  while (nextTime.isBefore(now)) {
+    nextTime = calculateNextNotificationTime(Task(
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      dateTime: nextTime,
+      frequency: task.frequency,
+      periodicity: task.periodicity,
+    ));
+  }
+  
+  return nextTime;
+}
+
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+ 
+ await Workmanager().initialize(
+    callbackDispatcher,
+    isInDebugMode: true
+  );
+
   tz.initializeTimeZones();
   await initNotifications();
   runApp(const MyApp());
@@ -157,7 +267,25 @@ class TaskListScreenState extends State<TaskListScreen> {
   void initState() {
     super.initState();
     _loadTasks();
+     _schedulePeriodicCheck();
   }
+
+void _schedulePeriodicCheck() {
+  Workmanager().registerPeriodicTask(
+    "taskChecker",
+    "checkScheduledTasks",
+    frequency: const Duration(minutes: 15),  // Minimální interval je 15 minut
+    initialDelay: const Duration(seconds: 10),
+    constraints: Constraints(
+      networkType: NetworkType.not_required,
+      requiresBatteryNotLow: false,
+      requiresCharging: false,
+      requiresDeviceIdle: false,
+      requiresStorageNotLow: false,
+    ),
+  );
+}
+
 
   Future<void> _loadTasks() async {
     final loadedTasks = await DatabaseHelper.instance.getTasks();
@@ -501,19 +629,83 @@ final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
 Future<void> initNotifications() async {
-  tz.initializeTimeZones();
   const AndroidInitializationSettings initializationSettingsAndroid =
       AndroidInitializationSettings('@mipmap/ic_launcher');
+
   const DarwinInitializationSettings initializationSettingsIOS =
-      DarwinInitializationSettings();
+      DarwinInitializationSettings(
+    requestAlertPermission: true,
+    requestBadgePermission: true,
+    requestSoundPermission: true,
+  );
+
   const InitializationSettings initializationSettings = InitializationSettings(
     android: initializationSettingsAndroid,
     iOS: initializationSettingsIOS,
   );
-  await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+
+  await flutterLocalNotificationsPlugin.initialize(
+    initializationSettings,
+    onDidReceiveNotificationResponse: (NotificationResponse details) {
+      print('Notification clicked: ${details.payload}');
+    },
+  );
+
+  // Request permissions right after initialization
+  await _requestNotificationPermissions();
+
+  // Add a test notification on app start
+  final now = tz.TZDateTime.now(tz.local);
+  const AndroidNotificationDetails androidPlatformChannelSpecifics =
+      AndroidNotificationDetails(
+    'task_notifications',
+    'Task Notifications',
+    channelDescription: 'Notifications for scheduled tasks',
+    importance: Importance.max,
+    priority: Priority.high,
+  );
+
+  const NotificationDetails platformChannelSpecifics =
+      NotificationDetails(android: androidPlatformChannelSpecifics);
+
+  await flutterLocalNotificationsPlugin.zonedSchedule(
+    99998, // unique ID for startup test notification
+    'App Started',
+    'Notification system initialized',
+    now.add(const Duration(seconds: 5)),
+    platformChannelSpecifics,
+    androidAllowWhileIdle: true,
+    uiLocalNotificationDateInterpretation:
+        UILocalNotificationDateInterpretation.absoluteTime,
+  );
+
+  print('Notifications initialized with test notification scheduled');
 }
 
-tz.TZDateTime _nextInstanceOfTime(tz.TZDateTime scheduledDate) {
+Future<void> _requestNotificationPermissions() async {
+  if (Platform.isAndroid) {
+    final AndroidFlutterLocalNotificationsPlugin? androidImplementation =
+        flutterLocalNotificationsPlugin.resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>();
+
+    if (androidImplementation != null) {
+      await androidImplementation.requestPermission();
+      print('Android notification permissions requested');
+    }
+  } else if (Platform.isIOS) {
+    final bool? result = await flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin>()
+        ?.requestPermissions(
+          alert: true,
+          badge: true,
+          sound: true,
+        );
+    print('iOS notification permissions result: $result');
+  }
+}
+
+/*tz.TZDateTime _nextInstanceOfTime(tz.TZDateTime scheduledDate) {
   final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
   tz.TZDateTime scheduledTime = tz.TZDateTime(
     tz.local,
@@ -528,7 +720,7 @@ tz.TZDateTime _nextInstanceOfTime(tz.TZDateTime scheduledDate) {
     scheduledTime = scheduledTime.add(const Duration(days: 1));
   }
   return scheduledTime;
-}
+} */
 
 tz.TZDateTime _nextInstanceOfWeekday(tz.TZDateTime scheduledDate) {
   tz.TZDateTime scheduledTime = _nextInstanceOfTime(scheduledDate);
@@ -547,86 +739,173 @@ tz.TZDateTime _nextInstanceOfMonthDay(tz.TZDateTime scheduledDate) {
 }
 
 Future<void> scheduleNotification(Task task) async {
-  const NotificationDetails platformChannelSpecifics = NotificationDetails(
-    android: AndroidNotificationDetails(
-      'your channel id',
-      'your channel name',
-      channelDescription: 'your channel description',
-      importance: Importance.max,
-      priority: Priority.high,
-    ),
-    iOS: DarwinNotificationDetails(),
+  // Create notification channel details
+  const AndroidNotificationDetails androidPlatformChannelSpecifics =
+      AndroidNotificationDetails(
+    'task_notifications', // channel id
+    'Task Notifications', // channel name
+    channelDescription: 'Notifications for scheduled tasks',
+    importance: Importance.max,
+    priority: Priority.high,
+    enableLights: true,
+    playSound: true,
+    // Remove custom sound to use default
+    visibility: NotificationVisibility.public,
+    showWhen: true,
+    enableVibration: true,
   );
 
-  final tz.TZDateTime scheduledDate =
-      tz.TZDateTime.from(task.dateTime, tz.local);
+  const NotificationDetails platformChannelSpecifics =
+      NotificationDetails(android: androidPlatformChannelSpecifics);
 
-  DateTimeComponents? matchDateTimeComponents;
-  tz.TZDateTime nextValidDate = scheduledDate;
+  final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
+  tz.TZDateTime scheduledDate = tz.TZDateTime.from(task.dateTime, tz.local);
 
-  switch (task.frequency) {
-    case 'custom':
-      // Pro vlastní periodicitu použijeme specifickou logiku
-      nextValidDate = _nextInstanceOfCustomPeriod(
-        scheduledDate,
-        task.periodicity ?? 14, // defaultně 14 dní, pokud není specifikováno
-      );
-      matchDateTimeComponents =
-          null; // Pro vlastní periodicitu nepoužíváme matchDateTimeComponents
-      break;
-    case 'daily':
-      matchDateTimeComponents = DateTimeComponents.time;
-      nextValidDate = _nextInstanceOfTime(scheduledDate);
-      break;
-    case 'weekly':
-      matchDateTimeComponents = DateTimeComponents.dayOfWeekAndTime;
-      nextValidDate = _nextInstanceOfWeekday(scheduledDate);
-      break;
-    case 'monthly':
-      matchDateTimeComponents = DateTimeComponents.dayOfMonthAndTime;
-      nextValidDate = _nextInstanceOfMonthDay(scheduledDate);
-      break;
-    case 'once':
-    default:
-      matchDateTimeComponents = null;
+  // Add debug prints
+  print('Scheduling notification for task: ${task.title}');
+  print('Frequency: ${task.frequency}');
+  print('Current time: $now');
+  print('Scheduled date: $scheduledDate');
+
+  // Ensure the scheduled time is in the future
+  if (scheduledDate.isBefore(now)) {
+    switch (task.frequency) {
+      case 'daily':
+        scheduledDate = _nextInstanceOfTime(scheduledDate);
+        break;
+      case 'weekly':
+        scheduledDate = _nextInstanceOfWeekday(scheduledDate);
+        break;
+      case 'monthly':
+        scheduledDate = _nextInstanceOfMonthDay(scheduledDate);
+        break;
+      case 'custom':
+        scheduledDate =
+            _nextInstanceOfCustomPeriod(scheduledDate, task.periodicity ?? 14);
+        break;
+      default:
+        // For one-time notifications in the past, don't schedule
+        print('One-time notification in the past, skipping...');
+        return;
+    }
+    print('Adjusted scheduled date: $scheduledDate');
   }
 
-  // Pro vlastní periodicitu musíme vytvořit sérii notifikací
-  if (task.frequency == 'custom') {
-    // Vytvoříme několik následujících notifikací
-    for (int i = 0; i < 10; i++) {
-      // Vytvoříme 10 následujících notifikací
-      final tz.TZDateTime notificationDate =
-          nextValidDate.add(Duration(days: i * (task.periodicity ?? 14)));
+  try {
+    // Add immediate test notification
+    await flutterLocalNotificationsPlugin.zonedSchedule(
+      99999, // unique ID for test notification
+      'Test Notification',
+      'This is a test notification',
+      now.add(const Duration(seconds: 5)), // Schedule for 5 seconds from now
+      platformChannelSpecifics,
+      androidAllowWhileIdle: true,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+    );
+    print('Test notification scheduled for 5 seconds from now');
 
-      // Kontrola, že datum není v minulosti
-      if (notificationDate.isAfter(tz.TZDateTime.now(tz.local))) {
+    // Schedule the actual task notification
+    switch (task.frequency) {
+      case 'daily':
         await flutterLocalNotificationsPlugin.zonedSchedule(
-          (task.id ?? 0) + (i * 1000), // Unikátní ID pro každou notifikaci
+          task.id ?? 0,
           task.title,
           task.description,
-          notificationDate,
+          scheduledDate,
+          platformChannelSpecifics,
+          androidAllowWhileIdle: true,
+          uiLocalNotificationDateInterpretation:
+              UILocalNotificationDateInterpretation.absoluteTime,
+          matchDateTimeComponents: DateTimeComponents.time,
+        );
+        print('Daily notification scheduled for: $scheduledDate');
+        break;
+
+      case 'weekly':
+        await flutterLocalNotificationsPlugin.zonedSchedule(
+          task.id ?? 0,
+          task.title,
+          task.description,
+          scheduledDate,
+          platformChannelSpecifics,
+          androidAllowWhileIdle: true,
+          uiLocalNotificationDateInterpretation:
+              UILocalNotificationDateInterpretation.absoluteTime,
+          matchDateTimeComponents: DateTimeComponents.dayOfWeekAndTime,
+        );
+        print('Weekly notification scheduled for: $scheduledDate');
+        break;
+
+      case 'monthly':
+        await flutterLocalNotificationsPlugin.zonedSchedule(
+          task.id ?? 0,
+          task.title,
+          task.description,
+          scheduledDate,
+          platformChannelSpecifics,
+          androidAllowWhileIdle: true,
+          uiLocalNotificationDateInterpretation:
+              UILocalNotificationDateInterpretation.absoluteTime,
+          matchDateTimeComponents: DateTimeComponents.dayOfMonthAndTime,
+        );
+        print('Monthly notification scheduled for: $scheduledDate');
+        break;
+
+      case 'custom':
+        // Schedule only the next occurrence for custom frequency
+        await flutterLocalNotificationsPlugin.zonedSchedule(
+          task.id ?? 0,
+          task.title,
+          task.description,
+          scheduledDate,
           platformChannelSpecifics,
           androidAllowWhileIdle: true,
           uiLocalNotificationDateInterpretation:
               UILocalNotificationDateInterpretation.absoluteTime,
         );
-      }
+        print('Custom notification scheduled for: $scheduledDate');
+        break;
+
+      default:
+        // One-time notification
+        if (scheduledDate.isAfter(now)) {
+          await flutterLocalNotificationsPlugin.zonedSchedule(
+            task.id ?? 0,
+            task.title,
+            task.description,
+            scheduledDate,
+            platformChannelSpecifics,
+            androidAllowWhileIdle: true,
+            uiLocalNotificationDateInterpretation:
+                UILocalNotificationDateInterpretation.absoluteTime,
+          );
+          print('One-time notification scheduled for: $scheduledDate');
+        }
     }
-  } else {
-    // Standardní notifikace pro ostatní frekvence
-    await flutterLocalNotificationsPlugin.zonedSchedule(
-      task.id ?? 0,
-      task.title,
-      task.description,
-      nextValidDate,
-      platformChannelSpecifics,
-      androidAllowWhileIdle: true,
-      uiLocalNotificationDateInterpretation:
-          UILocalNotificationDateInterpretation.absoluteTime,
-      matchDateTimeComponents: matchDateTimeComponents,
-    );
+  } catch (e, stackTrace) {
+    print('Error scheduling notification: $e');
+    print('Stack trace: $stackTrace');
   }
+}
+
+// Pomocná funkce pro výpočet příštího času
+tz.TZDateTime _nextInstanceOfTime(tz.TZDateTime scheduledDate) {
+  final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
+  tz.TZDateTime scheduledTime = tz.TZDateTime(
+    tz.local,
+    now.year,
+    now.month,
+    now.day,
+    scheduledDate.hour,
+    scheduledDate.minute,
+  );
+
+  if (scheduledTime.isBefore(now)) {
+    scheduledTime = scheduledTime.add(const Duration(days: 1));
+  }
+
+  return scheduledTime;
 }
 
 // Přidáme novou pomocnou funkci pro výpočet vlastní periodicity
@@ -647,17 +926,4 @@ tz.TZDateTime _nextInstanceOfCustomPeriod(
   }
 
   return scheduledTime;
-
-  /* await flutterLocalNotificationsPlugin.zonedSchedule(
-    task.id ?? 0,
-    task.title,
-    task.description,
-    // task.dateTime,
-    tz.TZDateTime.from(task.dateTime, tz.local),
-    platformChannelSpecifics,
-    androidAllowWhileIdle: true,
-    uiLocalNotificationDateInterpretation:
-        UILocalNotificationDateInterpretation.absoluteTime,
-    matchDateTimeComponents: DateTimeComponents.time,
-  ); */
 }
